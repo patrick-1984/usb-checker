@@ -36,3 +36,9 @@ jobs:
           assert result["scanner"].startswith("ClamAV "), result
           '
           sudo /usr/local/bin/usb-check --help | grep -q 'Direct read-only USB safety'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tested-release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
