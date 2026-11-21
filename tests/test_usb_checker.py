@@ -51,6 +51,23 @@ class DescriptorTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_replacement_requires_new_unique_unauthorized_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            port = root / "devices" / "4-1"
+            port.mkdir(parents=True)
+            (port / "authorized").write_text("0")
+            state = {"target": {"name": "7-1", "identity": ["2", 197910]}}
+            current = {"4-1": ["2", 200173]}
+            with patch.object(usb, "USB", root), patch.object(usb, "new_devices", return_value=current):
+                self.assertEqual(cli.replacement_device(state), ["4-1", ["2", 200173]])
+                current["7-1"] = ["2", 197910]
+                with self.assertRaisesRegex(CheckError, "one new USB"):
+                    cli.replacement_device(state)
+                del current["4-1"]
+                with self.assertRaisesRegex(CheckError, "still connected"):
+                    cli.replacement_device(state)
+
     def test_resume_uses_original_held_gate_and_one_unauthorized_identity(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

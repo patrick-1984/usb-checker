@@ -300,6 +300,51 @@ def resume(path):
     return status(path)
 
 
+def replacement_device(state):
+    devices = usb.new_devices(state)
+    old = state["target"]
+    if len(devices) != 1 or not old:
+        raise CheckError("A replacement check requires one new USB device and a previous device identity.")
+    name, identity = next(iter(devices.items()))
+    if {"name": name, "identity": identity} == old:
+        raise CheckError("The previous USB device is still connected.")
+    port = usb.USB / "devices" / name
+    if not usb.PORT.fullmatch(name) or (port / "authorized").read_text().strip() != "0":
+        raise CheckError("The replacement device must be unauthorized and on a direct port.")
+    return [name, identity]
+
+
+def next_case(previous):
+    with lock():
+        old_status = status(previous)
+        state = read_json(usb.JOURNAL)
+        if state["case"] != previous.name or old_status["phase"] != "held" or not old_status.get("result"):
+            raise CheckError("The preceding completed case must still hold the USB gate.")
+        device = replacement_device(state)
+        path = new_case()
+        status(path, phase="held", previous_case=previous.name, resume_device=device,
+               message="Preparing a direct check under the existing USB gate.")
+        old_rule = usb.RULE.read_text()
+        old_active = (STATE / "active").read_text()
+        next_state = {**state, "case": path.name, "target": None}
+        try:
+            usb.RULE.write_text(usb._rule_text())
+            usb._reload_rules()
+            write_json(usb.JOURNAL, next_state)
+            (STATE / "active").write_text(path.name)
+            status(path, phase="starting")
+            launch_case(path, 0, resumed=True)
+        except BaseException:
+            usb.RULE.write_text(old_rule)
+            usb._reload_rules()
+            write_json(usb.JOURNAL, state)
+            (STATE / "active").write_text(old_active)
+            status(path, phase="failed", message="The original USB gate remains held.")
+            raise
+        status(previous, successor=path.name)
+    return status(path)
+
+
 def stopped(path):
     with lock(wait=True):
         command(["systemctl", "stop", "usb-check-scan-{}.service".format(path.name)], check=False, timeout=25)
@@ -463,7 +508,7 @@ def main():
     for action in ("check", "start"):
         sub = subs.add_parser(action)
         sub.add_argument("--wait", type=int, choices=range(5, 601), metavar="SECONDS", default=600)
-    for action in ("status", "removed", "report", "resume", "_stopped", "_capture"):
+    for action in ("status", "removed", "report", "resume", "next", "_stopped", "_capture"):
         sub = subs.add_parser(action)
         sub.add_argument("case")
         if action == "_capture":
@@ -477,6 +522,7 @@ def main():
         "check": lambda: guided(options.wait),
         "status": lambda: status(case_path(options.case)), "removed": lambda: removed(case_path(options.case)),
         "resume": lambda: resume(case_path(options.case)),
+        "next": lambda: next_case(case_path(options.case)),
         "report": lambda: read_json(case_path(options.case) / "report.json"),
         "_capture": lambda: capture(case_path(options.case), options.wait, resumed=options.resumed),
         "_stopped": lambda: stopped(case_path(options.case)),

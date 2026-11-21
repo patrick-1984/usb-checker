@@ -23,7 +23,7 @@ Leave the drive unplugged and run `sudo usb-check check` on the host. For an SSH
 sudo usb-check check
 ```
 
-The job survives an SSH disconnect. Use `sudo usb-check gate-status` and `sudo usb-check status CASE` to recover. If insertion times out and the device is connected later, run `sudo usb-check resume CASE` to check the one new device under the original gate. USB Checker deauthorizes the device once the check finishes. The report is available before removal. Physically remove the device before running `sudo usb-check removed CASE` to restore USB. Its journal stays under `/run/usb-checker` until restoration. Device authorization resets under normal host boot policy.
+The job survives an SSH disconnect. Use `sudo usb-check gate-status` and `sudo usb-check status CASE` to recover. If insertion times out and the device is connected later, run `sudo usb-check resume CASE` to check the one new device under the original gate. USB Checker deauthorizes the device once the check finishes. The report is available before removal. Physically remove the device before running `sudo usb-check removed CASE` to restore USB. Its journal stays under `/run/usb-checker` until restoration. When an operator has replaced the previous device and the gate is still held, `sudo usb-check next CASE` starts a separate case under the original gate. Device authorization resets under normal host boot policy.
 
 ## Plugin
 
