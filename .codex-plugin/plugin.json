@@ -1,0 +1,11 @@
+{
+  "name": "usb-checker",
+  "version": "0.1.0",
+  "description": "Run a guided, read-only USB malware triage on a Linux host.",
+  "author": { "name": "patrick-1984" },
+  "homepage": "https://github.com/patrick-1984/usb-checker",
+  "repository": "https://github.com/patrick-1984/usb-checker",
+  "skills": "./skills/",
+  "mcpServers": "./mcp-codex.json",
+  "interface": { "displayName": "USB Checker" }
+}
