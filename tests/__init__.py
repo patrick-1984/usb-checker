@@ -1,0 +1,1 @@
+"""USB Checker test package."""
