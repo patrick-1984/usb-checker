@@ -164,6 +164,27 @@ class DirectScanTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_discarded_candidates_consume_attempt_and_byte_budgets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            limits = []
+
+            def tool(args, *, size=0, destination=None, **kwargs):
+                if destination is None:
+                    return 0, "r/r 1: one\nr/r 2: two\nr/r 3: three\n", ""
+                limits.append(size)
+                destination.write_bytes(b"x" * size)
+                return 1, "", "over limit"
+
+            with patch.multiple(scanner, STAGE_LIMIT=7, FILE_LIMIT=5, FILE_COUNT=2, tool=tool), \
+                    patch.object(scanner, "Path", side_effect=lambda path: root / Path(path).name):
+                samples, issues = {}, []
+                attempted, extracted = scanner.collect_files(512, [], issues, [], samples)
+            self.assertEqual((attempted, extracted), (2, 7))
+            self.assertEqual(limits, [5, 2])
+            self.assertFalse(samples)
+            self.assertTrue(any("budget" in item for item in issues))
+
     def test_report_limits_cannot_hide_later_clamav_signature(self):
         findings = [{"severity": "review"}] * scanner.REPORT_FINDINGS + [{"severity": "malicious"}]
         evidence = scanner.summarize_findings(findings)

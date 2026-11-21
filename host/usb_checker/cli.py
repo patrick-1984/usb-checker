@@ -151,7 +151,8 @@ def write_report(path, analysis, *, verdict=None):
     lines.extend(["", "Limitations ({})".format(len(limitations))])
     lines.extend("- " + safe_label(item) for item in limitations)
     (path / "report.txt").write_text("\n".join(lines) + "\n")
-    return {"case": path.name, "verdict": verdict, "coverage": coverage, "report": str(path / "report.json")}
+    return {"case": path.name, "verdict": verdict, "coverage": coverage, "limitations": limitations,
+            "report": str(path / "report.json")}
 
 
 def resume_state(path):
@@ -327,7 +328,7 @@ def removed(path):
     if current["phase"] not in ("held", "remove"):
         if current.get("removal_confirmed"):
             return current
-        raise CheckError("Removal can be confirmed after imaging, refusal or a held gate.")
+        raise CheckError("Removal can be confirmed after the check, refusal or a held gate.")
     if current["phase"] == "held":
         with lock(wait=True):
             current = status(path)
@@ -358,10 +359,18 @@ def guided(wait_seconds):
     path = case_path(current["case"])
     print("USB Checker case {}".format(path.name), flush=True)
     sequence = None
+    reported = False
     try:
         while True:
             current = status(path)
             phase = current["phase"]
+            result = current.get("result")
+            if result and not reported:
+                print("Verdict {}. Coverage {}. Report {}".format(
+                    result["verdict"], result["coverage"], result["report"]), flush=True)
+                for limit in result.get("limitations", []):
+                    print("- " + safe_label(limit), flush=True)
+                reported = True
             signature = (phase, current.get("message"))
             if signature != sequence:
                 sequence = signature

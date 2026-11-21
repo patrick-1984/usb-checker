@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from time import time
+from time import monotonic, time
 
 from .common import CheckError, clam_args
 
@@ -19,6 +19,7 @@ CLAM = Path("/mnt/clamav")
 STAGE_LIMIT = 32 * 1024 * 1024
 FILE_LIMIT = 8 * 1024 * 1024
 FILE_COUNT = 128
+FILE_COLLECTION_SECONDS = 60
 REPORT_FINDINGS = 1000
 OUTPUT_LIMIT = 4 * 1024 * 1024
 EXECUTABLE = re.compile(r"\.(exe|com|scr|bat|cmd|ps1|vbs|js|lnk|msi|elf|sh)$", re.I)
@@ -157,10 +158,15 @@ def file_review(name, address, offset, deleted):
 
 
 def collect_files(sector, partitions, issues, findings, samples):
-    total = 0
+    extracted = attempted = 0
+    deadline = monotonic() + FILE_COLLECTION_SECONDS
     for offset in [item["start_sector"] for item in partitions] or [0]:
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            issues.append("The filesystem triage time budget was reached.")
+            break
         arguments = ["-i", "raw", "-b", str(sector), "-o", str(offset)]
-        rc, listing, _ = tool(["/usr/bin/fls", "-F", "-r", "-p", *arguments, SOURCE], timeout=180)
+        rc, listing, _ = tool(["/usr/bin/fls", "-F", "-r", "-p", *arguments, SOURCE], timeout=min(30, remaining))
         if rc:
             issues.append("Filesystem at sector {} is unsupported or unreadable.".format(offset))
             continue
@@ -173,25 +179,29 @@ def collect_files(sector, partitions, issues, findings, samples):
             kind, deleted, address, name = entry.groups()
             if not kind.startswith("r/") or name.startswith("$OrphanFiles/"):
                 continue
-            if len(samples) >= FILE_COUNT or total >= STAGE_LIMIT:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                issues.append("The filesystem triage time budget was reached.")
+                return attempted, extracted
+            if attempted >= FILE_COUNT or extracted >= STAGE_LIMIT:
                 issues.append("The file count or total scan budget was reached.")
-                return
+                return attempted, extracted
             findings.extend(file_review(name, address, offset, bool(deleted)))
             sample = Path("/tmp/scan/{:06d}.bin".format(len(samples)))
             args = ["/usr/bin/icat", *arguments]
             if deleted:
                 args.append("-r")
-            if total >= STAGE_LIMIT:
-                break
-            cap = min(FILE_LIMIT, STAGE_LIMIT - total)
-            rc, _, _ = tool([*args, SOURCE, address], size=cap + 1, destination=sample, timeout=45)
+            attempted += 1
+            cap = min(FILE_LIMIT, STAGE_LIMIT - extracted)
+            rc, _, _ = tool([*args, SOURCE, address], size=cap, destination=sample, timeout=min(5, remaining))
             length = sample.stat().st_size
+            extracted += length
             if rc or length > cap:
                 sample.unlink()
                 issues.append("Files beyond the size or recovery limits were skipped.")
                 continue
-            total += length
             samples[sample.name] = {"file": safe_label(name), "sector": offset, "deleted": bool(deleted)}
+    return attempted, extracted
 
 
 def scan(sector, image_size):
@@ -199,7 +209,7 @@ def scan(sector, image_size):
     partitions, unallocated = layout(sector, image_size, issues, findings)
     Path("/tmp/scan").mkdir()
     samples = {}
-    collect_files(sector, partitions, issues, findings, samples)
+    attempted, extracted = collect_files(sector, partitions, issues, findings, samples)
     definitions = signature_status(DEFS, lambda args: tool([*clam_args(CLAM, "sigtool"), *args]))
     if definitions["state"] != "fresh":
         issues.append("ClamAV definitions are {}.".format(definitions["state"]))
@@ -207,7 +217,7 @@ def scan(sector, image_size):
         args = [*clam_args(CLAM, "clamscan"), "--database=/mnt/definitions", "--recursive=yes", "--infected", "--no-summary",
                 "--max-filesize=8M", "--max-scansize=24M", "--max-recursion=8",
                 "--alert-exceeds-max=yes", "--alert-encrypted=yes", "/tmp/scan"]
-        rc, output, err = tool(args, timeout=900, temporary_file_limit=128 * 1024 * 1024)
+        rc, output, err = tool(args, timeout=180, temporary_file_limit=128 * 1024 * 1024)
         for line in output.split("\n"):
             matched = re.fullmatch(r"/tmp/scan/([0-9]+\.bin): (.{1,300}) FOUND", line)
             if matched and matched.group(1) in samples:
@@ -223,7 +233,8 @@ def scan(sector, image_size):
                 message += " " + safe_label(err)
             issues.append(message)
     return {"partitions": partitions, "unallocated": unallocated, **summarize_findings(findings),
-            "limitations": sorted(set(issues)), "definitions": definitions, "selected_files": len(samples)}
+            "limitations": sorted(set(issues)), "definitions": definitions, "selected_files": len(samples),
+            "attempted_files": attempted, "extracted_bytes": extracted}
 
 
 def summarize_findings(findings):
