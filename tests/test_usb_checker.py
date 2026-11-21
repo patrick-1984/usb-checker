@@ -88,6 +88,27 @@ class GateTests(unittest.TestCase):
                 with self.assertRaisesRegex(CheckError, "unauthorized"):
                     cli.resume_state(root)
 
+    def test_resume_cannot_retarget_a_preworker_replacement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = {"case": root.name, "published": True, "target": None,
+                     "expected_device": ["4-1", ["2", 200173]]}
+            with patch.object(cli, "read_json", return_value=state), \
+                    patch.object(usb, "new_devices", return_value={"4-1": ["3", 289010]}), \
+                    self.assertRaisesRegex(CheckError, "authorized replacement identity"):
+                cli.resume_state(root)
+
+    def test_rollover_keeps_original_runtime_rule_until_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rule = Path(temporary) / "rule"
+            rule.write_text(usb._rule_text("7-1"))
+            state = {"target": None, "held_rule_port": "7-1", "settings": [], "mask_intended": False}
+            with patch.object(usb, "RULE", rule):
+                usb.assert_gate(state)
+                state["target"] = {"name": "4-1"}
+                with self.assertRaisesRegex(CheckError, "rule changed"):
+                    usb.assert_gate(state)
+
     def test_resume_cannot_replace_existing_result(self):
         state = {"phase": "held", "held_reason": "insertion-timeout", "result": {"verdict": "refused"}}
         with patch.object(cli, "lock", return_value=nullcontext()), patch.object(cli, "status", return_value=state), \
@@ -146,6 +167,23 @@ class GateTests(unittest.TestCase):
                     self.assertTrue(usb.restore_gate(state, confirmed=True))
             self.assertFalse(journal.exists())
             self.assertEqual(setting.read_text().strip(), "-1")
+
+    def test_unexpected_runtime_rule_keeps_authorization_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            setting = root / "default"
+            setting.write_text("0\n")
+            rule = root / "rule"
+            rule.write_text("# unrelated rule\n")
+            state = {
+                "baseline": {}, "target": None, "held_rule_port": "7-1", "published": True,
+                "settings": [{"path": str(setting), "before": "-1"}],
+            }
+            with patch.object(usb, "RULE", rule), patch.object(usb, "usb_snapshot", return_value={}):
+                with self.assertRaisesRegex(CheckError, "unexpected change"):
+                    usb.restore_gate(state, confirmed=True)
+            self.assertEqual(setting.read_text().strip(), "0")
+            self.assertEqual(rule.read_text(), "# unrelated rule\n")
 
 
 class DirectScanTests(unittest.TestCase):

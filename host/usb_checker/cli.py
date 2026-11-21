@@ -163,6 +163,8 @@ def resume_state(path):
     if len(devices) != 1:
         raise CheckError("Resume requires exactly one newly connected USB device.")
     name, identity = next(iter(devices.items()))
+    if state.get("expected_device", [name, identity]) != [name, identity]:
+        raise CheckError("The connected device does not match the authorized replacement identity.")
     if state["target"] is not None and state["target"] != {"name": name, "identity": identity}:
         raise CheckError("The connected device does not match the original held identity.")
     if not usb.PORT.fullmatch(name) or (usb.USB / "devices" / name / "authorized").read_text().strip() != "0":
@@ -288,12 +290,15 @@ def resume(path):
         previous = status(path)
         if previous["phase"] != "held" or previous.get("result"):
             raise CheckError("Only an incomplete held case can resume the USB check.")
-        _, device = resume_state(path)
-        current = {"case": path.name, "phase": "starting", "resume_device": device,
+        state, device = resume_state(path)
+        state["expected_device"] = device
+        write_json(usb.JOURNAL, state)
+        current = {"case": path.name, "phase": "held", "resume_device": device,
                    "message": "Resuming the held USB check."}
         write_json(path / "status.json", current)
         try:
             launch_case(path, 0, resumed=True)
+            status(path, phase="starting")
         except BaseException:
             write_json(path / "status.json", previous)
             raise
@@ -324,19 +329,15 @@ def next_case(previous):
         path = new_case()
         status(path, phase="held", previous_case=previous.name, resume_device=device,
                message="Preparing a direct check under the existing USB gate.")
-        old_rule = usb.RULE.read_text()
         old_active = (STATE / "active").read_text()
-        next_state = {**state, "case": path.name, "target": None}
+        next_state = {**state, "case": path.name, "target": None,
+                      "held_rule_port": state["target"]["name"], "expected_device": device}
         try:
-            usb.RULE.write_text(usb._rule_text())
-            usb._reload_rules()
             write_json(usb.JOURNAL, next_state)
             (STATE / "active").write_text(path.name)
-            status(path, phase="starting")
             launch_case(path, 0, resumed=True)
+            status(path, phase="starting")
         except BaseException:
-            usb.RULE.write_text(old_rule)
-            usb._reload_rules()
             write_json(usb.JOURNAL, state)
             (STATE / "active").write_text(old_active)
             status(path, phase="failed", message="The original USB gate remains held.")

@@ -108,6 +108,14 @@ if [ ! -d "$release" ]; then
     "$release_stage/usb-check" doctor
     mv -T "$release_stage" "$release"
     release_stage=
+else
+    for source in "$src"/usb_checker/*.py; do
+        cmp -s "$source" "$release/usb_checker/${source##*/}" ||
+            { echo "The staged USB Checker package differs from the installer payload." >&2; exit 1; }
+    done
+    cmp -s "$src/usb-check" "$release/usb-check" ||
+        { echo "The staged USB Checker command differs from the installer payload." >&2; exit 1; }
+    "$release/usb-check" doctor
 fi
 link_stage=$(mktemp -d /usr/local/bin/.usb-check.XXXXXX)
 ln -s "$release/usb-check" "$link_stage/usb-check"

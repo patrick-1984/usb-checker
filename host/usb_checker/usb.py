@@ -135,7 +135,7 @@ def assert_gate(state):
             not RUNTIME_MASK.is_symlink() or os.readlink(RUNTIME_MASK) != "/dev/null"):
         raise CheckError("The UDisks runtime mask changed during the check.")
     target = state["target"]
-    if RULE.read_text() != _rule_text(target["name"] if target else None):
+    if RULE.read_text() != _rule_text(target["name"] if target else state.get("held_rule_port")):
         raise CheckError("The USB Checker runtime rule changed during the check.")
 
 
@@ -319,18 +319,19 @@ def restore_gate(state, confirmed=False):
                           for name, identity in snapshot.items())
     if has_new_devices or (state["published"] and not confirmed):
         return False
-    # Restore defaults after removal. Preserve unrelated operator changes.
+    if RULE.is_file():
+        target = state["target"]
+        expected = _rule_text(target["name"] if target else state.get("held_rule_port"))
+        held = _rule_text(state.get("held_rule_port"))
+        if RULE.read_text() not in (_rule_text(), expected, held):
+            raise CheckError("An unexpected change to the USB Checker runtime rule needs manual review.")
+        RULE.unlink()
+    _reload_rules()
+    # Restore defaults after removal and after removing our runtime rule.
     for entry in reversed(state["settings"]):
         path = Path(entry["path"])
         if path.exists() and path.read_text().strip() == "0":
             _write(path, entry["before"])
-    if RULE.is_file():
-        target = state["target"]
-        expected = _rule_text(target["name"] if target else None)
-        if RULE.read_text() not in (_rule_text(), expected):
-            raise CheckError("An unexpected change to the USB Checker runtime rule needs manual review.")
-        RULE.unlink()
-    _reload_rules()
     if state["mask_intended"] and RUNTIME_MASK.is_symlink() and os.readlink(RUNTIME_MASK) == "/dev/null":
         command(["systemctl", "unmask", "--runtime", "udisks2.service"], timeout=20)
     if state["service_active"]:

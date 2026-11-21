@@ -9,6 +9,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -18,3 +20,16 @@ jobs:
       - run: sh -n host/install.sh
       - run: python scripts/build.py
       - run: cd dist && sha256sum -c SHA256SUMS
+      - name: Clean install from the candidate artifact
+        run: |
+          test ! -e /usr/local/bin/usb-check
+          sudo sh ./dist/install.sh
+          sudo /usr/local/bin/usb-check doctor | python -c '
+          import json, sys
+          result = json.load(sys.stdin)
+          assert result["version"] == "0.1.0", result
+          assert result["sandbox"] == "ok", result
+          assert result["gate_held"] is False, result
+          assert result["scanner"].startswith("ClamAV "), result
+          '
+          sudo /usr/local/bin/usb-check --help | grep -q 'Direct read-only USB safety'
