@@ -1,8 +1,10 @@
-import hashlib
+import array
+import fcntl
 import json
 import os
 import re
 import resource
+import stat
 import subprocess
 import tempfile
 from email.utils import parsedate_to_datetime
@@ -11,12 +13,12 @@ from time import time
 
 from .common import CheckError, clam_args
 
-SOURCE = "/mnt/source.img"
+SOURCE = "/mnt/usb-source"
 DEFS = Path("/mnt/definitions")
 CLAM = Path("/mnt/clamav")
-STAGE_LIMIT = 256 * 1024 * 1024
-FILE_LIMIT = 32 * 1024 * 1024
-FILE_COUNT = 1000
+STAGE_LIMIT = 32 * 1024 * 1024
+FILE_LIMIT = 8 * 1024 * 1024
+FILE_COUNT = 128
 REPORT_FINDINGS = 1000
 OUTPUT_LIMIT = 4 * 1024 * 1024
 EXECUTABLE = re.compile(r"\.(exe|com|scr|bat|cmd|ps1|vbs|js|lnk|msi|elf|sh)$", re.I)
@@ -203,7 +205,7 @@ def scan(sector, image_size):
         issues.append("ClamAV definitions are {}.".format(definitions["state"]))
     if definitions["state"] != "missing" and samples:
         args = [*clam_args(CLAM, "clamscan"), "--database=/mnt/definitions", "--recursive=yes", "--infected", "--no-summary",
-                "--max-filesize=32M", "--max-scansize=96M", "--max-recursion=12",
+                "--max-filesize=8M", "--max-scansize=24M", "--max-recursion=8",
                 "--alert-exceeds-max=yes", "--alert-encrypted=yes", "/tmp/scan"]
         rc, output, err = tool(args, timeout=900, temporary_file_limit=128 * 1024 * 1024)
         for line in output.split("\n"):
@@ -231,12 +233,16 @@ def summarize_findings(findings):
             "omitted_findings": max(0, len(findings) - REPORT_FINDINGS)}
 
 
-def digest_image(path):
-    digest = hashlib.sha256()
-    with path.open("rb") as image:
-        for chunk in iter(lambda: image.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def verify_device(identity):
+    found = os.stat(SOURCE)
+    expected = "{}:{}".format(os.major(found.st_rdev), os.minor(found.st_rdev))
+    if not stat.S_ISBLK(found.st_mode) or expected != identity or expected == "8:0":
+        raise CheckError("The sandbox received a different block device.")
+    with open(SOURCE, "rb") as media:
+        readonly = array.array("i", [0])
+        fcntl.ioctl(media.fileno(), 0x125E, readonly)
+    if readonly[0] != 1:
+        raise CheckError("The sandbox block device is not read-only.")
 
 
 def sandbox_main():
@@ -264,6 +270,8 @@ def sandbox_main():
         definitions = signature_status(DEFS, lambda args: tool([*clam_args(CLAM, "sigtool"), *args]))
         print(json.dumps({"sandbox": "ok", "definitions": definitions}))
     else:
+        if len(sys.argv) == 4:
+            verify_device(sys.argv[3])
         print(json.dumps(scan(int(sys.argv[1]), int(sys.argv[2])), ensure_ascii=True))
 
 

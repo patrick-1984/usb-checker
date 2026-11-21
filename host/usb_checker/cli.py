@@ -18,9 +18,8 @@ from .common import (
     CASES, CLAM, DATA, DEFINITIONS, STATE, CheckError, case_path,
     clam_args, command, read_json, write_json,
 )
-from .scanner import digest_image, safe_label, signature_status
+from .scanner import safe_label, signature_status
 
-MIN_FREE = 384 * 1024 * 1024
 FINAL_PHASES = {"done", "failed", "refused", "held", "timeout"}
 
 
@@ -51,7 +50,7 @@ def new_case():
     return path
 
 
-def sandbox(image, arguments, *, directory=DEFINITIONS):
+def sandbox(source, arguments, *, directory=DEFINITIONS, device=None, unit=None, monitor=None):
     scanner = Path(__file__).resolve().parent.parent
     properties = [
         "DynamicUser=yes", "PrivateNetwork=yes", "PrivateDevices=yes", "NoNewPrivileges=yes",
@@ -60,15 +59,38 @@ def sandbox(image, arguments, *, directory=DEFINITIONS):
         "RestrictSUIDSGID=yes", "LockPersonality=yes", "CapabilityBoundingSet=", "TasksMax=24",
         "MemoryMax=1450M", "RuntimeMaxSec=27min", "UMask=0077",
         "TemporaryFileSystem=/run:ro /var:ro /etc:ro /tmp:mode=1777,size=320M,noexec,nodev,nosuid",
-        "BindReadOnlyPaths={}:/mnt/source.img {}:/mnt/definitions {}:/mnt/clamav {}:/mnt/checker".format(
-            image, directory, CLAM, scanner),
+        "BindReadOnlyPaths={}:/mnt/usb-source {}:/mnt/definitions {}:/mnt/clamav {}:/mnt/checker".format(
+            source, directory, CLAM, scanner),
     ]
     args = ["systemd-run", "--quiet", "--pipe", "--wait", "--collect", "--setenv=LC_ALL=C"]
+    if device:
+        properties.extend(["DeviceAllow={} r".format(device), "SupplementaryGroups=disk"])
+        args.append("--unit=" + unit)
     args.extend("--property=" + prop for prop in properties)
     args.extend(["/usr/bin/python3", "-I", "-c",
                  "import runpy,sys;sys.path.insert(0,'/mnt/checker');"
                  "runpy.run_module('usb_checker.scanner',run_name='__main__')"])
-    return command([*args, *arguments], timeout=1650)
+    args.extend(arguments)
+    if monitor is None:
+        return command(args, timeout=1650)
+    environment = {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"}
+    with subprocess.Popen(args, env=environment, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            while True:
+                monitor()
+                try:
+                    output, error = process.communicate(timeout=1)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        except BaseException:
+            command(["systemctl", "stop", unit + ".service"], check=False, timeout=25)
+            process.kill()
+            process.communicate()
+            raise
+    if process.returncode:
+        raise CheckError("Read-only analysis sandbox failed: {}".format(safe_label(error)))
+    return subprocess.CompletedProcess(args, 0, output, error)
 
 
 def sandbox_probe():
@@ -79,26 +101,27 @@ def sandbox_probe():
     return details
 
 
-def scan_image(path, image, sector, *, waiting_for_removal=False):
-    if not waiting_for_removal:
-        status(path, phase="analyzing", message="Inspecting partition layout and scanning files in the sandbox.")
-    before = digest_image(image)
+def scan_device(path, fd, disk, size, sector, monitor):
+    status(path, phase="analyzing", message="Inspecting the read-only USB device directly. Keep it connected until the result is ready.")
+    number = os.fstat(fd).st_rdev
+    identity = "{}:{}".format(os.major(number), os.minor(number))
+    source = "/proc/{}/fd/{}".format(os.getpid(), fd)
     try:
-        result = sandbox(image, [str(sector), str(image.stat().st_size)])
+        result = sandbox(source, [str(sector), str(size), identity], device="/dev/" + disk,
+                         unit="usb-check-scan-" + path.name, monitor=monitor)
         analysis = json.loads(result.stdout)
         if not isinstance(analysis, dict) or not isinstance(analysis.get("limitations"), list):
             raise ValueError("Invalid scanner response")
     except (CheckError, OSError, ValueError, subprocess.SubprocessError) as error:
+        monitor()
         analysis = {"limitations": ["Analysis sandbox failed: {}".format(safe_label(str(error)))],
                     "findings": [], "partitions": [], "unallocated": [], "selected_files": 0}
-    expected = status(path).get("image_sha256")
-    if before != expected or digest_image(image) != expected:
-        raise CheckError("The image hash changed after capture.")
+    monitor()
     analysis.update({
-        "schema_version": 1, "case": path.name, "image_sha256": expected,
-        "size_bytes": image.stat().st_size, "sector_bytes": sector,
+        "schema_version": 1, "case": path.name, "kernel_read_only": True,
+        "size_bytes": size, "sector_bytes": sector,
         "usb": status(path).get("usb"),
-        "scope": "Partition layout, gap samples and selected filesystem files",
+        "scope": "USB classes, read-only partition layout, gap samples and bounded filesystem malware triage",
     })
     return write_report(path, analysis)
 
@@ -118,7 +141,7 @@ def write_report(path, analysis, *, verdict=None):
     write_json(path / "report.json", analysis)
     lines = [
         "USB Checker report", "", "Case {}".format(path.name), "Verdict {}".format(verdict),
-        "Coverage {}".format(coverage), "SHA-256 {}".format(analysis.get("image_sha256") or "unavailable"),
+        "Coverage {}".format(coverage),
         "Scope {}".format(analysis.get("scope", "USB device class inspection")),
         "", "Findings ({})".format(len(findings)),
     ]
@@ -128,55 +151,19 @@ def write_report(path, analysis, *, verdict=None):
     lines.extend(["", "Limitations ({})".format(len(limitations))])
     lines.extend("- " + safe_label(item) for item in limitations)
     (path / "report.txt").write_text("\n".join(lines) + "\n")
-    return {"case": path.name, "verdict": verdict, "coverage": coverage,
-            "image_sha256": analysis.get("image_sha256"), "report": str(path / "report.json")}
-
-
-def image_copy(path, fd, size, monitor=lambda: None, verify_source=lambda: None):
-    if shutil.disk_usage(path).free < size + MIN_FREE:
-        raise CheckError("Insufficient space for the image while retaining 384 MiB of free space.")
-    written = 0
-    last_update = 0
-    digest = hashlib.sha256()
-    partial = path / "image.partial"
-    with partial.open("xb") as output:
-        while written < size:
-            monitor()
-            chunk = os.read(fd, min(1024 * 1024, size - written))
-            if not chunk:
-                raise CheckError("The source ended before its advertised size.")
-            output.write(chunk)
-            digest.update(chunk)
-            written += len(chunk)
-            now = time.monotonic()
-            if now - last_update >= 2:
-                status(path, phase="imaging", bytes_read=written, size_bytes=size,
-                       message="Creating a read-only evidence image.")
-                last_update = now
-        monitor()
-        verify_source()
-        output.flush()
-        os.fsync(output.fileno())
-    expected = digest.hexdigest()
-    status(path, phase="verifying", bytes_read=written, size_bytes=size, message="Re-reading the image to verify SHA-256.")
-    if digest_image(partial) != expected:
-        raise CheckError("The evidence image failed SHA-256 verification.")
-    monitor()
-    os.chmod(partial, 0o444)
-    image = path / "image.raw"
-    partial.rename(image)
-    status(path, image_sha256=expected, size_bytes=written)
-    return image
+    return {"case": path.name, "verdict": verdict, "coverage": coverage, "report": str(path / "report.json")}
 
 
 def resume_state(path):
     state = read_json(usb.JOURNAL)
-    if state["case"] != path.name or not state["published"] or state["target"] is not None:
+    if state["case"] != path.name or not state["published"]:
         raise CheckError("This case cannot adopt a USB device while held.")
     devices = usb.new_devices(state)
     if len(devices) != 1:
         raise CheckError("Resume requires exactly one newly connected USB device.")
     name, identity = next(iter(devices.items()))
+    if state["target"] is not None and state["target"] != {"name": name, "identity": identity}:
+        raise CheckError("The connected device does not match the original held identity.")
     if not usb.PORT.fullmatch(name) or (usb.USB / "devices" / name / "authorized").read_text().strip() != "0":
         raise CheckError("Resume requires one unauthorized USB device on a direct port.")
     return state, [name, identity]
@@ -223,24 +210,24 @@ def capture(path, wait_seconds, *, resumed=False):
             }, verdict="refused")
             status(path, phase="remove", result=report,
                    message="USB refused. Physically unplug it and confirm removal.")
-            image = None
+            refused = True
         else:
             def monitor():
                 if usb.new_devices(state) != {name: identity}:
-                    raise CheckError("USB identity changed during imaging. The image is incomplete.")
+                    raise CheckError("USB identity changed during the direct check.")
                 if len(list(interface.glob("host*/target*/*:*:*:*"))) > 1:
                     raise CheckError("Multiple storage LUNs are refused.")
 
             fd, size, sector, disk = usb.open_disk(state, interface, monitor)
             try:
-                status(path, device=disk, sector_bytes=sector, kernel_read_only=True)
-                image = image_copy(path, fd, size, monitor)
+                status(path, device=disk, size_bytes=size, sector_bytes=sector, kernel_read_only=True)
+                report = scan_device(path, fd, disk, size, sector, monitor)
             finally:
                 os.close(fd)
             usb.deauthorize(state)
-            status(path, phase="remove", message="Image verified. Analysis is running. Physically unplug the device and confirm removal when ready.")
-            report = scan_image(path, image, sector, waiting_for_removal=True)
-            status(path, result=report)
+            status(path, phase="remove", result=report,
+                   message="Report ready. Physically unplug the device and confirm removal when ready.")
+            refused = False
 
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
@@ -255,7 +242,7 @@ def capture(path, wait_seconds, *, resumed=False):
             status(path, phase="held", message="USB remains held. Physically unplug the device before confirming removal.")
             return
 
-        if image is None:
+        if refused:
             status(path, phase="refused", message="Unsupported or unsafe USB classes. Device refused.")
         else:
             status(path, phase="done", result=report, message="Report ready.")
@@ -298,11 +285,12 @@ def start(wait_seconds):
 def resume(path):
     with lock():
         previous = status(path)
-        timeout = previous.get("held_reason") == "insertion-timeout" or previous.get("message", "").startswith("Insertion timeout.")
-        if previous["phase"] != "held" or not timeout or previous.get("image_sha256") or previous.get("result"):
-            raise CheckError("Only a held insertion timeout can resume capture.")
+        if previous["phase"] != "held" or previous.get("result"):
+            raise CheckError("Only an incomplete held case can resume the USB check.")
         _, device = resume_state(path)
-        status(path, phase="starting", resume_device=device, message="Resuming the held USB check.")
+        current = {"case": path.name, "phase": "starting", "resume_device": device,
+                   "message": "Resuming the held USB check."}
+        write_json(path / "status.json", current)
         try:
             launch_case(path, 0, resumed=True)
         except BaseException:
@@ -313,6 +301,7 @@ def resume(path):
 
 def stopped(path):
     with lock(wait=True):
+        command(["systemctl", "stop", "usb-check-scan-{}.service".format(path.name)], check=False, timeout=25)
         if not usb.JOURNAL.exists():
             if status(path)["phase"] not in FINAL_PHASES:
                 status(path, phase="failed", message="USB Checker stopped before completing the case.")
@@ -373,15 +362,11 @@ def guided(wait_seconds):
         while True:
             current = status(path)
             phase = current["phase"]
-            signature = (phase, current.get("message"), current.get("bytes_read"))
+            signature = (phase, current.get("message"))
             if signature != sequence:
                 sequence = signature
                 print(current["message"], flush=True)
-                if phase == "imaging":
-                    print("{:,} of {:,} bytes".format(current["bytes_read"], current["size_bytes"]), flush=True)
                 if phase in ("remove", "held"):
-                    if current.get("image_sha256"):
-                        print("SHA-256 {}".format(current["image_sha256"]), flush=True)
                     if not sys.stdin.isatty():
                         return current
                     answer = input('Type "removed" after physically unplugging the device, or press Enter to leave USB held: ')
@@ -399,33 +384,6 @@ def guided(wait_seconds):
             time.sleep(0.3)
     except (KeyboardInterrupt, EOFError):
         raise CheckError("The job continues on the host. Recover with usb-check status {}.".format(path.name))
-
-
-def analyze(source, sector):
-    with lock():
-        pinned = os.open(source, os.O_PATH | os.O_NOFOLLOW)
-        try:
-            initial = os.fstat(pinned)
-            if not stat.S_ISREG(initial.st_mode) or initial.st_size <= 0 or initial.st_size % sector:
-                raise CheckError("Analyze requires a regular image file aligned to the sector size.")
-            fd = os.open("/proc/self/fd/{}".format(pinned), os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                path = new_case()
-
-                def unchanged():
-                    final = os.fstat(fd)
-                    if (initial.st_size, initial.st_mtime_ns, initial.st_ctime_ns) != (
-                            final.st_size, final.st_mtime_ns, final.st_ctime_ns):
-                        raise CheckError("The source image changed during capture.")
-
-                image = image_copy(path, fd, initial.st_size, verify_source=unchanged)
-            finally:
-                os.close(fd)
-        finally:
-            os.close(pinned)
-        result = scan_image(path, image, sector)
-        status(path, phase="done", result=result, message="Report ready.")
-        return result
 
 
 def clam_tool(name, args):
@@ -489,7 +447,7 @@ def doctor():
 def main():
     os.umask(0o077)
     os.environ["PATH"] = "/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin"
-    parser = argparse.ArgumentParser(prog="usb-check", description="Read-only USB capture and malware triage.")
+    parser = argparse.ArgumentParser(prog="usb-check", description="Direct read-only USB safety and malware triage.")
     subs = parser.add_subparsers(dest="action", required=True)
     for action in ("version", "doctor", "gate-status", "update-signatures"):
         subs.add_parser(action)
@@ -502,15 +460,12 @@ def main():
         if action == "_capture":
             sub.add_argument("wait", type=int)
             sub.add_argument("--resumed", action="store_true")
-    sub = subs.add_parser("analyze")
-    sub.add_argument("image", type=Path)
-    sub.add_argument("--sector-size", type=int, choices=[512, 1024, 2048, 4096], default=512)
     options = parser.parse_args()
     actions = {
         "version": lambda: {"version": __version__},
         "doctor": doctor, "gate-status": lambda: read_json(usb.JOURNAL) if usb.JOURNAL.exists() else {"armed": False},
         "update-signatures": update_signatures, "start": lambda: start(options.wait),
-        "check": lambda: guided(options.wait), "analyze": lambda: analyze(options.image, options.sector_size),
+        "check": lambda: guided(options.wait),
         "status": lambda: status(case_path(options.case)), "removed": lambda: removed(case_path(options.case)),
         "resume": lambda: resume(case_path(options.case)),
         "report": lambda: read_json(case_path(options.case) / "report.json"),

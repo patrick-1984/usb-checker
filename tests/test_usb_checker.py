@@ -74,7 +74,7 @@ class GateTests(unittest.TestCase):
     def test_resume_cannot_replace_existing_result(self):
         state = {"phase": "held", "held_reason": "insertion-timeout", "result": {"verdict": "refused"}}
         with patch.object(cli, "lock", return_value=nullcontext()), patch.object(cli, "status", return_value=state), \
-                patch.object(cli, "launch_case") as launch, self.assertRaisesRegex(CheckError, "Only a held"):
+                patch.object(cli, "launch_case") as launch, self.assertRaisesRegex(CheckError, "Only an incomplete held"):
             cli.resume(Path("case"))
         launch.assert_not_called()
 
@@ -131,36 +131,36 @@ class GateTests(unittest.TestCase):
             self.assertEqual(setting.read_text().strip(), "-1")
 
 
-class ImageTests(unittest.TestCase):
-    def test_analyze_rejects_block_inode_without_opening_it_for_data(self):
-        node = Mock(st_mode=stat.S_IFBLK)
-        with patch.object(cli, "lock", return_value=nullcontext()), patch.object(cli.os, "open", return_value=42) as opened, \
-                patch.object(cli.os, "fstat", return_value=node), patch.object(cli.os, "close"):
-            with self.assertRaisesRegex(CheckError, "regular image"):
-                cli.analyze(Path("/dev/sda"), 512)
-        opened.assert_called_once_with(Path("/dev/sda"), os.O_PATH | os.O_NOFOLLOW)
+class DirectScanTests(unittest.TestCase):
+    def test_sandbox_refuses_system_disk_identity_before_opening(self):
+        entry = Mock(st_mode=stat.S_IFBLK, st_rdev=os.makedev(8, 0))
+        with patch.object(scanner.os, "stat", return_value=entry), patch("builtins.open") as opened:
+            with self.assertRaisesRegex(CheckError, "different block device"):
+                scanner.verify_device("8:0")
+            opened.assert_not_called()
 
-    def test_read_only_image_hash_verified(self):
+    def test_scan_passes_the_exact_read_only_device_and_creates_only_reports(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            original = b"hello" * 2048
-            source.write_bytes(original)
-            with source.open("rb") as handle:
-                image = cli.image_copy(root, handle.fileno(), len(original))
-            self.assertEqual(image.read_bytes(), original)
-            self.assertEqual(cli.status(root)["image_sha256"], hashlib.sha256(original).hexdigest())
-            self.assertEqual(image.stat().st_mode & 0o777, 0o444)
+            monitor = Mock()
+            response = Mock(stdout='{"findings":[],"limitations":[],"selected_files":2}')
+            node = Mock(st_rdev=os.makedev(8, 16))
+            with patch.object(cli, "sandbox", return_value=response) as sandbox, patch.object(cli.os, "fstat", return_value=node):
+                report = cli.scan_device(root, 42, "sdb", 51200, 512, monitor)
+            sandbox.assert_called_once_with(
+                "/proc/{}/fd/42".format(os.getpid()), ["512", "51200", "8:16"],
+                device="/dev/sdb", unit="usb-check-scan-" + root.name, monitor=monitor,
+            )
+            self.assertEqual(report["verdict"], "nothing-found")
+            self.assertEqual({item.name for item in root.iterdir()}, {"status.json", "report.json", "report.txt"})
 
-    def test_short_read_has_no_verified_image(self):
+    def test_direct_check_marks_sandbox_failure_as_partial(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            source = root / "source"
-            source.write_bytes(b"x")
-            with source.open("rb") as handle, self.assertRaisesRegex(CheckError, "advertised size"):
-                cli.image_copy(root, handle.fileno(), 512)
-            self.assertFalse((root / "image.raw").exists())
-            self.assertNotIn("image_sha256", cli.status(root))
+            node = Mock(st_rdev=os.makedev(8, 16))
+            with patch.object(cli, "sandbox", side_effect=CheckError("No read-only bind")), patch.object(cli.os, "fstat", return_value=node):
+                report = cli.scan_device(root, 42, "sdb", 51200, 512, Mock())
+            self.assertEqual((report["verdict"], report["coverage"]), ("review", "partial"))
 
 
 class ReportTests(unittest.TestCase):
