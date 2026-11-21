@@ -51,6 +51,33 @@ class DescriptorTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_resume_uses_original_held_gate_and_one_unauthorized_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            device = root / "devices" / "1-2"
+            device.mkdir(parents=True)
+            (device / "authorized").write_text("0")
+            state = {"case": root.name, "published": True, "target": None}
+            identity = ["7", 123]
+            with patch.object(usb, "USB", root), patch.object(cli, "read_json", return_value=state), \
+                    patch.object(usb, "new_devices", return_value={"1-2": identity}) as current:
+                self.assertEqual(cli.resume_state(root), (state, ["1-2", identity]))
+                current.assert_called_once_with(state)
+                current.return_value["1-3"] = ["8", 124]
+                with self.assertRaisesRegex(CheckError, "exactly one"):
+                    cli.resume_state(root)
+                del current.return_value["1-3"]
+                (device / "authorized").write_text("1")
+                with self.assertRaisesRegex(CheckError, "unauthorized"):
+                    cli.resume_state(root)
+
+    def test_resume_cannot_replace_existing_result(self):
+        state = {"phase": "held", "held_reason": "insertion-timeout", "result": {"verdict": "refused"}}
+        with patch.object(cli, "lock", return_value=nullcontext()), patch.object(cli, "status", return_value=state), \
+                patch.object(cli, "launch_case") as launch, self.assertRaisesRegex(CheckError, "Only a held"):
+            cli.resume(Path("case"))
+        launch.assert_not_called()
+
     def test_duplicate_removal_cannot_apply_a_stale_gate(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

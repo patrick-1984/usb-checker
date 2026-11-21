@@ -11,7 +11,6 @@ CASES = DATA / "cases"
 DEFINITIONS = DATA / "definitions"
 INSTALL = Path("/opt/usb-checker")
 CLAM = INSTALL / "clamav" / "1.4.7" / "usr/local"
-CLI = "/usr/local/bin/usb-check"
 CASE_PATTERN = re.compile(r"[0-9a-f]{16}")
 
 

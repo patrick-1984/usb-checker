@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import stat
 import subprocess
@@ -14,7 +15,7 @@ from pathlib import Path
 
 from . import __version__, usb
 from .common import (
-    CASES, CLI, CLAM, DATA, DEFINITIONS, STATE, CheckError, case_path,
+    CASES, CLAM, DATA, DEFINITIONS, STATE, CheckError, case_path,
     clam_args, command, read_json, write_json,
 )
 from .scanner import digest_image, safe_label, signature_status
@@ -78,8 +79,9 @@ def sandbox_probe():
     return details
 
 
-def scan_image(path, image, sector):
-    status(path, phase="analyzing", message="Inspecting partition layout and scanning files in the sandbox.")
+def scan_image(path, image, sector, *, waiting_for_removal=False):
+    if not waiting_for_removal:
+        status(path, phase="analyzing", message="Inspecting partition layout and scanning files in the sandbox.")
     before = digest_image(image)
     try:
         result = sandbox(image, [str(sector), str(image.stat().st_size)])
@@ -167,20 +169,40 @@ def image_copy(path, fd, size, monitor=lambda: None, verify_source=lambda: None)
     return image
 
 
-def capture(path, wait_seconds):
+def resume_state(path):
+    state = read_json(usb.JOURNAL)
+    if state["case"] != path.name or not state["published"] or state["target"] is not None:
+        raise CheckError("This case cannot adopt a USB device while held.")
+    devices = usb.new_devices(state)
+    if len(devices) != 1:
+        raise CheckError("Resume requires exactly one newly connected USB device.")
+    name, identity = next(iter(devices.items()))
+    if not usb.PORT.fullmatch(name) or (usb.USB / "devices" / name / "authorized").read_text().strip() != "0":
+        raise CheckError("Resume requires one unauthorized USB device on a direct port.")
+    return state, [name, identity]
+
+
+def capture(path, wait_seconds, *, resumed=False):
     with lock(wait=True):
         sandbox_probe()
-        state = usb.prepare_gate(path.name)
-        status(path, phase="armed", message="USB gate is armed. Plug in one device directly. Keep the host powered on.")
-        deadline = time.monotonic() + wait_seconds
-        while time.monotonic() < deadline:
-            arrived = usb.new_devices(state)
-            if arrived:
-                break
-            time.sleep(0.25)
+        if resumed:
+            state, device = resume_state(path)
+            if status(path).get("resume_device") != device:
+                raise CheckError("USB identity changed before the resumed case started.")
+            arrived = {device[0]: device[1]}
         else:
-            status(path, phase="held", message="Insertion timeout. Confirm suspect media is physically removed to restore USB.")
-            return
+            state = usb.prepare_gate(path.name)
+            status(path, phase="armed", message="USB gate is armed. Plug in one device directly. Keep the host powered on.")
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                arrived = usb.new_devices(state)
+                if arrived:
+                    break
+                time.sleep(0.25)
+            else:
+                status(path, phase="held", held_reason="insertion-timeout",
+                       message="Insertion timeout. Resume with one attached device or confirm removal to restore USB.")
+                return
         try:
             if len(arrived) != 1:
                 raise CheckError("More than one new USB device was detected.")
@@ -216,7 +238,9 @@ def capture(path, wait_seconds):
             finally:
                 os.close(fd)
             usb.deauthorize(state)
-            status(path, phase="remove", message="Image verified. Physically unplug the device and confirm removal.")
+            status(path, phase="remove", message="Image verified. Analysis is running. Physically unplug the device and confirm removal when ready.")
+            report = scan_image(path, image, sector, waiting_for_removal=True)
+            status(path, result=report)
 
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
@@ -234,8 +258,20 @@ def capture(path, wait_seconds):
         if image is None:
             status(path, phase="refused", message="Unsupported or unsafe USB classes. Device refused.")
         else:
-            result = scan_image(path, image, sector)
-            status(path, phase="done", result=result, message="Report ready.")
+            status(path, phase="done", result=report, message="Report ready.")
+
+
+def launch_case(path, wait_seconds, *, resumed=False):
+    executable = str(Path(sys.argv[0]).resolve())
+    args = [
+        "systemd-run", "--quiet", "--collect", "--unit=usb-check-" + path.name,
+        "--property=Type=exec", "--property=RuntimeMaxSec=6h", "--property=UMask=0077",
+        "--property=ExecStopPost={} _stopped {}".format(shlex.quote(executable), path.name),
+        executable, "_capture", path.name, str(wait_seconds),
+    ]
+    if resumed:
+        args.append("--resumed")
+    command(args, timeout=30)
 
 
 def start(wait_seconds):
@@ -252,14 +288,25 @@ def start(wait_seconds):
         status(path, phase="starting", message="Checking sandbox and USB gate prerequisites.")
         current.write_text(path.name)
         try:
-            command([
-                "systemd-run", "--quiet", "--collect", "--unit=usb-check-" + path.name,
-                "--property=Type=exec", "--property=RuntimeMaxSec=6h", "--property=UMask=0077",
-                "--property=ExecStopPost={} _stopped {}".format(CLI, path.name),
-                CLI, "_capture", path.name, str(wait_seconds),
-            ], timeout=30)
+            launch_case(path, wait_seconds)
         except BaseException:
             current.unlink(missing_ok=True)
+            raise
+    return status(path)
+
+
+def resume(path):
+    with lock():
+        previous = status(path)
+        timeout = previous.get("held_reason") == "insertion-timeout" or previous.get("message", "").startswith("Insertion timeout.")
+        if previous["phase"] != "held" or not timeout or previous.get("image_sha256") or previous.get("result"):
+            raise CheckError("Only a held insertion timeout can resume capture.")
+        _, device = resume_state(path)
+        status(path, phase="starting", resume_device=device, message="Resuming the held USB check.")
+        try:
+            launch_case(path, 0, resumed=True)
+        except BaseException:
+            write_json(path / "status.json", previous)
             raise
     return status(path)
 
@@ -279,8 +326,9 @@ def stopped(path):
             restored = False
         if not restored:
             current = status(path)
-            previous = current.get("message", "The job stopped.")
-            status(path, phase="held", message=previous + " Confirm physical removal to restore USB.")
+            if current["phase"] != "held":
+                previous = current.get("message", "The job stopped.")
+                status(path, phase="held", message=previous + " Confirm physical removal to restore USB.")
         elif status(path)["phase"] not in FINAL_PHASES:
             status(path, phase="failed", message="USB Checker stopped before capture started.")
 
@@ -304,9 +352,9 @@ def removed(path):
             restored = usb.restore_gate(gate, confirmed=True)
             if not restored:
                 raise CheckError("A new USB device appeared before restore.")
-            previous = current.get("result")
-            status(path, phase="refused" if previous else "failed", removal_confirmed=True,
-                   message="USB gate restored.")
+            result = current.get("result")
+            phase = "refused" if result and result["verdict"] == "refused" else "done" if result else "failed"
+            status(path, phase=phase, removal_confirmed=True, message="USB gate restored.")
     else:
         # The capture worker owns the gate lock. A marker is scoped to this case
         # and the worker verifies both the gate and device absence before restore.
@@ -448,11 +496,12 @@ def main():
     for action in ("check", "start"):
         sub = subs.add_parser(action)
         sub.add_argument("--wait", type=int, choices=range(5, 601), metavar="SECONDS", default=600)
-    for action in ("status", "removed", "report", "_stopped", "_capture"):
+    for action in ("status", "removed", "report", "resume", "_stopped", "_capture"):
         sub = subs.add_parser(action)
         sub.add_argument("case")
         if action == "_capture":
             sub.add_argument("wait", type=int)
+            sub.add_argument("--resumed", action="store_true")
     sub = subs.add_parser("analyze")
     sub.add_argument("image", type=Path)
     sub.add_argument("--sector-size", type=int, choices=[512, 1024, 2048, 4096], default=512)
@@ -463,8 +512,9 @@ def main():
         "update-signatures": update_signatures, "start": lambda: start(options.wait),
         "check": lambda: guided(options.wait), "analyze": lambda: analyze(options.image, options.sector_size),
         "status": lambda: status(case_path(options.case)), "removed": lambda: removed(case_path(options.case)),
+        "resume": lambda: resume(case_path(options.case)),
         "report": lambda: read_json(case_path(options.case) / "report.json"),
-        "_capture": lambda: capture(case_path(options.case), options.wait),
+        "_capture": lambda: capture(case_path(options.case), options.wait, resumed=options.resumed),
         "_stopped": lambda: stopped(case_path(options.case)),
     }
     try:
