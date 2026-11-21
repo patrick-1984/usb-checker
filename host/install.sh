@@ -95,7 +95,7 @@ if ! test -x "$clam_dir/usr/local/bin/clamscan"; then
     fi
     mv -T "$stage/clamav" "$clam_dir"
 fi
-version=0.1.0
+version=0.1.1
 release="$base/releases/$version-$payload_digest"
 if [ ! -d "$release" ]; then
     release_stage=$(mktemp -d "$base/releases/.candidate.XXXXXX")

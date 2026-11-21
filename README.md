@@ -7,7 +7,7 @@ USB Checker guides a direct read-only safety check of a USB drive on a dedicated
 Use Debian or Ubuntu on aarch64 or x86-64 with systemd and apt. Installation uses signed ClamAV 1.4.7 packages and distribution packages for Sleuth Kit. Definitions come from the ClamAV CDN through FreshClam.
 
 ```sh
-base=https://github.com/patrick-1984/usb-checker/releases/download/v0.1.0
+base=https://github.com/patrick-1984/usb-checker/releases/download/v0.1.1
 curl -fSLO "$base/install.sh"
 curl -fSLO "$base/SHA256SUMS"
 sha256sum --ignore-missing -c SHA256SUMS
@@ -17,13 +17,40 @@ sudo usb-check doctor
 
 ## Check a USB drive
 
-Leave the drive unplugged and run `sudo usb-check check` on the host. For an SSH target, allocate a terminal with `ssh -t`. Insert one device directly when the checker says the gate is armed. After the direct check or refusal, physically unplug the device and type `removed` when prompted. Leave the host powered on while the gate is held.
+Leave the drive unplugged and start the guided check on the host. Insert one device directly when the checker says the gate is armed. Physically unplug it and type `removed` at the prompt.
 
 ```sh
 sudo usb-check check
 ```
 
-The job survives an SSH disconnect. Use `sudo usb-check gate-status` and `sudo usb-check status CASE` to recover. If insertion times out and the device is connected later, run `sudo usb-check resume CASE` to check the one new device under the original gate. USB Checker deauthorizes the device once the check finishes. The report is available before removal. Physically remove the device before running `sudo usb-check removed CASE` to restore USB. Its journal stays under `/run/usb-checker` until restoration. When an operator has replaced the previous device and the gate is still held, `sudo usb-check next CASE` starts a separate case under the original gate. Device authorization resets under normal host boot policy.
+For example, if `orangepi3b` is your SSH host alias and you connect as root, allocate a terminal for the prompt.
+
+```sh
+ssh -t root@orangepi3b usb-check check
+```
+
+### Resume or finish a case
+
+The job survives an SSH disconnect. After reconnecting to the host, use `gate-status` to find the held case ID. Replace the example ID below with the one from your check.
+
+```sh
+sudo usb-check gate-status
+case_id=8df42193a7c80216
+sudo usb-check status "$case_id"
+```
+
+Run the command that matches the case status and what is plugged in.
+
+| Situation | Command |
+|---|---|
+| An incomplete case is `held` after an insertion timeout and exactly one new device is now connected directly. | `sudo usb-check resume "$case_id"` |
+| The case status contains a result, even if the drive is still connected. | `sudo usb-check report "$case_id"` |
+| The case is at `remove` or `held` and you physically unplugged the drive. | `sudo usb-check removed "$case_id"` |
+| A completed case is `held`, the original drive is out, and one replacement is connected directly. | `sudo usb-check next "$case_id"` |
+
+If you are replacing a drive and the case is still at `remove`, wait for it to reach `held` before running `next`. The removal wait lasts up to 10 minutes. Use the new case ID returned by `next` for later commands.
+
+USB Checker deauthorizes a checked drive before showing the removal prompt. Keep the host powered on while the gate is held. A reboot resets the USB authorization policy.
 
 ## Plugin
 
@@ -31,7 +58,7 @@ In Claude Code, add the `patrick-1984/marketplace` marketplace, install `usb-che
 
 ## Reports
 
-Reports live in root-private directories under `/var/lib/usb-checker/cases`. Read a report with `sudo usb-check report CASE` and refresh definitions with `sudo usb-check update-signatures`.
+Reports live in root-private directories under `/var/lib/usb-checker/cases`. Refresh definitions with `sudo usb-check update-signatures`.
 
 The supported device has one configuration and one SCSI bulk-only mass-storage interface. USB hubs, composite devices, UAS-only devices, and multiple storage LUNs are refused. The Linux USB core reads descriptors and the approved storage driver reads sectors. The application excludes `/dev/sda`, previously present disks, mounted or claimed storage, and devices outside the approved interface. It opens the selected block device read-only and verifies the kernel read-only flag. USB Checker suppresses the host’s standard automount paths, rejects mounted or claimed storage, and holds an exclusive read-only descriptor during its check. Use a dedicated triage host without additional storage consumers. Linux creates the block node before the checker verifies the read-only flag.
 

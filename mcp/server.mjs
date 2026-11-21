@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
-const version = "0.1.0";
+const version = "0.1.1";
 const protocols = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"];
 const targetPattern = /^(?:[A-Za-z0-9_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const casePattern = /^[0-9a-f]{16}$/;

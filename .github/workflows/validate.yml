@@ -30,7 +30,7 @@ jobs:
           sudo /usr/local/bin/usb-check doctor | python -c '
           import json, sys
           result = json.load(sys.stdin)
-          assert result["version"] == "0.1.0", result
+          assert result["version"] == "0.1.1", result
           assert result["sandbox"] == "ok", result
           assert result["gate_held"] is False, result
           assert result["scanner"].startswith("ClamAV "), result
